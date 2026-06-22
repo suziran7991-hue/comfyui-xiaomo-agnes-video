@@ -28,6 +28,26 @@
 ```bash
 git clone https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video.git
 ```
+
+## GitHub访问超时/443端口连接失败解决办法
+### 1. 全新安装使用镜像加速克隆（推荐）
+打开 custom_nodes 目录CMD执行：
+```bash
+git clone https://mirror.ghproxy.com/https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video.git
+```
+### 2. 已安装插件更新失败
+进入插件文件夹执行：
+```bash
+git remote set-url origin https://mirror.ghproxy.com/https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video.git
+```
+```bash
+git pull
+```
+### 3. 镜像依旧无法连接（离线备用方案）
+1. 前往项目主页点击 Code → Download ZIP 下载源码压缩包；
+2. 删除原有 comfyui-xiaomo-agnes-video 文件夹；
+3. 解压压缩包，文件夹重命名为 comfyui-xiaomo-agnes-video 放入 custom_nodes；
+4. 重启ComfyUI完成更新。
 ## 使用说明
 在输入框 肖默_API密钥 填写你个人的 Agnes 平台 API Key
 肖默_图片公网HTTPS链接 填入图床上传后的公开图片地址，本地图片文件路径无法读取，必须填写公网图片链接
