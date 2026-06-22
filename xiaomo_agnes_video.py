@@ -1,173 +1,158 @@
 import requests
-import json
+import torch
 import time
+import json
+from io import BytesIO
+import av
+import numpy as np
 
-class XiaoMo_AgnesV2Image2Video:
-    # 菜单分类（展示中文，合规）
-    CATEGORY = "肖默定制插件/Agnes视频API"
+# Agnes AI 基础配置
+BASE_API_URL = "https://apihub.agnes-ai.com/v1/videos"
+MODEL_NAME = "agnes-video-v2.0"
 
+class XiaoMoAgnesVideo:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "api_key": (
-                    "STRING",
-                    {
-                        "multiline": False,
-                        "default": "sk-粘贴你的Agnes API密钥",
-                        "display_name": "肖默_API密钥"
-                    }
-                ),
-                "image_url": (
-                    "STRING",
-                    {
-                        "multiline": True,
-                        "default": "https://xxx/xxx.png",
-                        "display_name": "肖默_图片公网HTTPS链接"
-                    }
-                ),
-                "prompt": (
-                    "STRING",
-                    {
-                        "multiline": True,
-                        "default": "流畅自然运动，人物主体稳定无变形，无画面闪烁，电影运镜，高细节",
-                        "display_name": "肖默_正向提示词"
-                    }
-                ),
-                "negative_prompt": (
-                    "STRING",
-                    {
-                        "multiline": True,
-                        "default": "面部扭曲、画面闪烁、肢体变形、模糊、崩坏结构、水印",
-                        "display_name": "肖默_反向提示词"
-                    }
-                ),
-                "width": (
-                    "INT",
-                    {
-                        "default": 1152,
-                        "min": 512,
-                        "max": 1920,
-                        "display_name": "肖默_视频宽度"
-                    }
-                ),
-                "height": (
-                    "INT",
-                    {
-                        "default": 768,
-                        "min": 384,
-                        "max": 1080,
-                        "display_name": "肖默_视频高度"
-                    }
-                ),
-                "num_frames": (
-                    "INT",
-                    {
-                        "default": 121,
-                        "min": 9,
-                        "max": 441,
-                        "display_name": "肖默_总帧数(8n+1)"
-                    }
-                ),
-                "frame_rate": (
-                    "INT",
-                    {
-                        "default": 24,
-                        "min": 1,
-                        "max": 60,
-                        "display_name": "肖默_帧率FPS"
-                    }
-                ),
-                "seed": (
-                    "INT",
-                    {"default": 123456, "display_name": "肖默_随机种子"}
-                ),
-                "poll_interval": (
-                    "INT",
-                    {
-                        "default": 5,
-                        "min": 3,
-                        "max": 20,
-                        "display_name": "肖默_轮询间隔(秒)"
-                    }
-                ),
+                "API密钥": ("STRING", {"multiline": False, "default": "sk-粘贴你的Agnes API密钥"}),
+                "图片公网HTTPS链接": ("STRING", {"multiline": True, "default": "https://xxx/xxx.png"}),
+
+                # 外接提示词设为单行，区分内置多行输入框
+                "外接正向提示词": ("STRING", {"default": "", "multiline": False}),
+                "正向提示词": ("STRING", {
+                    "multiline": True,
+                    "default": "流畅自然运动，人物主体稳定无变形，无画面闪烁，电影运镜，高细节"
+                }),
+
+                "外接反向提示词": ("STRING", {"default": "", "multiline": False}),
+                "反向提示词": ("STRING", {
+                    "multiline": True,
+                    "default": "面部扭曲、画面闪烁、肢体变形、模糊、崩坏结构、水印"
+                }),
+
+                "视频宽度": ("INT", {"default": 1152, "min": 512, "max": 2048, "step": 64}),
+                "视频高度": ("INT", {"default": 768, "min": 512, "max": 2048, "step": 64}),
+                "总帧数(8n+1)": ("INT", {"default": 121, "min": 81, "max": 441, "step": 40}),
+                "帧率FPS": ("INT", {"default": 24, "min": 12, "max": 30, "step": 1}),
+                "随机种子": ("INT", {"default": 123456}),
+                "生成后控制": (["randomize", "fixed"],),
+                "轮询间隔(秒)": ("INT", {"default": 5, "min": 2, "max": 20, "step": 1}),
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("肖默_视频MP4下载直链", "肖默_完整任务返回JSON")
-    FUNCTION = "generate_video_task"
+    # 双输出：1.可预览保存VIDEO流 2.完整任务JSON文本
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("视频输出", "完整任务JSON")
+    FUNCTION = "run"
+    CATEGORY = "肖默定制插件"
 
-    def generate_video_task(
-        self,
-        api_key,
-        image_url,
-        prompt,
-        negative_prompt,
-        width,
-        height,
-        num_frames,
-        frame_rate,
-        seed,
-        poll_interval
-    ):
-        base_create_url = "https://apihub.agnes-ai.com/v1/videos"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-
-        # 帧数校验
-        if (num_frames - 1) % 8 != 0:
-            return ("", f"【肖默专属节点提示】错误：总帧数必须满足8n+1，可用：81/121/241/441")
-
-        payload = {
-            "model": "agnes-video-v2.0",
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "image": image_url,
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-            "seed": seed
-        }
-
-        # 提交任务
+    def download_video_to_tensor(self, video_url):
+        """下载云端MP4，转为ComfyUI标准 [B, Frame, H, W, C] VIDEO张量"""
         try:
-            resp = requests.post(base_create_url, headers=headers, json=payload, timeout=30)
-            task_json = resp.json()
-        except Exception as e:
-            return ("", f"【肖默专属节点提示】任务提交异常：{str(e)}")
+            resp = requests.get(video_url, timeout=60)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"视频文件下载失败：{str(e)}")
 
-        if resp.status_code != 200:
-            return ("", json.dumps(task_json, indent=2, ensure_ascii=False))
+        video_bytes = BytesIO(resp.content)
+        frame_list = []
+        with av.open(video_bytes) as container:
+            video_stream = container.streams.video[0]
+            for frame in container.decode(video_stream):
+                rgb_img = frame.to_image().convert("RGB")
+                frame_array = np.array(rgb_img, dtype=np.float32) / 255.0
+                frame_list.append(torch.from_numpy(frame_array))
 
-        video_id = task_json.get("video_id")
-        if not video_id:
-            return ("", json.dumps(task_json, indent=2, ensure_ascii=False))
+        if len(frame_list) == 0:
+            raise Exception("视频解析失败，未读取到任何画面帧")
+        video_tensor = torch.stack(frame_list, dim=0).unsqueeze(0)
+        return video_tensor
 
-        # 轮询查询
-        query_url = f"https://apihub.agnes-ai.com/agnesapi?video_id={video_id}&model_name=agnes-video-v2.0"
+    def run(self,
+            API密钥,
+            图片公网HTTPS链接,
+            外接正向提示词,
+            正向提示词,
+            外接反向提示词,
+            反向提示词,
+            视频宽度,
+            视频高度,
+            总帧数,
+            帧率FPS,
+            随机种子,
+            生成后控制,
+            轮询间隔):
+
+        # 逻辑：外部连线有内容则优先使用外部提示词，否则使用框内手动文字
+        final_pos_prompt = 外接正向提示词.strip() if 外接正向提示词.strip() else 正向提示词.strip()
+        final_neg_prompt = 外接反向提示词.strip() if 外接反向提示词.strip() else 反向提示词.strip()
+
+        # 请求头鉴权
+        headers = {
+            "Authorization": f"Bearer {API密钥}",
+            "Content-Type": "application/json"
+        }
+
+        # 1. 构造Agnes图生视频请求体
+        payload = {
+            "model": MODEL_NAME,
+            "image": 图片公网HTTPS链接,
+            "prompt": final_pos_prompt,
+            "negative_prompt": final_neg_prompt,
+            "width": 视频宽度,
+            "height": 视频高度,
+            "num_frames": 总帧数,
+            "frame_rate": 帧率FPS,
+            "seed": 随机种子 if 生成后控制 == "fixed" else None
+        }
+
+        # 2. 创建异步视频任务，捕获网络异常
+        try:
+            create_resp = requests.post(BASE_API_URL, headers=headers, json=payload, timeout=30)
+            create_resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"创建视频任务请求失败：{str(e)}")
+
+        task_data = create_resp.json()
+        task_id = task_data["id"]
+
+        # 3. 循环轮询任务状态，直到完成/失败
+        final_task_data = None
         while True:
             try:
-                query_resp = requests.get(query_url, headers=headers, timeout=30)
-                res_json = query_resp.json()
-            except Exception as e:
-                return ("", f"【肖默专属节点提示】查询异常：{str(e)}")
+                poll_resp = requests.get(f"{BASE_API_URL}/{task_id}", headers=headers, timeout=30)
+                poll_resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                raise Exception(f"轮询任务状态请求失败：{str(e)}")
 
-            status = res_json.get("status")
+            final_task_data = poll_resp.json()
+            status = final_task_data["status"]
+
             if status == "completed":
-                mp4_url = res_json.get("remixed_from_video_id", "")
-                return (mp4_url, json.dumps(res_json, indent=2, ensure_ascii=False))
-            if status == "failed":
-                return ("【肖默专属节点提示】视频生成失败", json.dumps(res_json, indent=2, ensure_ascii=False))
-            time.sleep(poll_interval)
+                break
+            if status in ["failed", "cancelled"]:
+                err_msg = final_task_data.get("error", {}).get("message", "未知生成失败")
+                raise Exception(f"视频生成任务失败：{err_msg}")
+            # 等待指定秒数再次轮询
+            time.sleep(轮询间隔)
 
-# 节点注册映射（底层key纯英文，展示名带肖默）
+        # 4. 提取MP4下载直链，增加空值校验防止崩溃
+        mp4_url = final_task_data.get("remixed_from_video_id")
+        if not mp4_url:
+            raise Exception("任务已完成，但未获取到视频下载链接，请查看完整任务JSON排查详情")
+
+        # 完整JSON转为字符串用于第二个输出端口
+        full_json_str = json.dumps(final_task_data, ensure_ascii=False, indent=2)
+        # 下载视频转为ComfyUI视频张量
+        video_output_tensor = self.download_video_to_tensor(mp4_url)
+
+        return (video_output_tensor, full_json_str)
+
+# 插件节点注册
 NODE_CLASS_MAPPINGS = {
-    "XiaoMo_AgnesV2Image2Video": XiaoMo_AgnesV2Image2Video
+    "XiaoMoAgnesVideo": XiaoMoAgnesVideo
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiaoMo_AgnesV2Image2Video": "肖默 - Agnes V2.0 图生视频节点"
+    "XiaoMoAgnesVideo": "肖默 - Agnes V2.0 图生视频节点"
 }
