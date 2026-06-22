@@ -1,0 +1,17 @@
+[project]
+name = "xiaomo-agnes-video"
+version = "1.0.0"
+description = "肖默定制 Agnes V2.0 图生视频API节点，自动轮询异步任务"
+authors = [{ name = "肖默" }]
+license = { file = "LICENSE" }
+dependencies = ["requests>=2.30.0"]
+
+[project.urls]
+Repository = "https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video"
+"Bug Tracker" = "https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video/issues"
+
+[tool.comfy]
+PublisherId = "publisher-id-here"
+DisplayName = "肖默 - Agnes V2.0 图生视频节点"
+Category = "Video Generation"
+Icon = ""
