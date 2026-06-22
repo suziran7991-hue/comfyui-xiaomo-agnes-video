@@ -23,14 +23,25 @@ git clone https://github.com/suziran7991-hue/comfyui-xiaomo-agnes-video.git
 ```
 ## 使用说明
 在输入框 肖默_API密钥 填写你个人的 Agnes 平台 API Key
-肖默_图片公网HTTPS链接 填入图床上传后的公开图片地址，本地文件无法识别
+肖默_图片公网HTTPS链接 填入图床上传后的公开图片地址，本地图片文件路径无法读取，必须填写公网图片链接
 帧数仅支持标准数值：81、121、241、441，其他数字会弹窗提示错误
 正向提示词描述画面运动、镜头风格；反向提示词屏蔽崩坏、闪烁、变形等问题
 输出端口 1 为完整 MP4 视频下载链接，端口 2 为任务完整返回 JSON，用于排查报错
 依赖说明
 插件自动依赖 requests 网络库，Manager 安装时会自动部署，手动安装缺失可执行：
+
+### Windows便携通用安装依赖方法
+- 1. 打开ComfyUI根目录（python_embeded所在的文件夹）CMD，执行：
 ```bash
 python_embeded\python.exe -m pip install requests>=2.30.0
+```
+- 2. 如果提示找不到路径，使用完整绝对路径示例（按自己盘符修改）
+D:\ComfyUI\python_embeded\python.exe -m pip install requests>=2.30.0
+
+- 3. 若以上都无效，直接运行启动脚本内置Python：
+# 双击 run_nvidia_gpu.bat 启动ComfyUI，在弹出的黑窗口输入：
+```bash
+pip install requests>=2.30.0
 ```
 # 自愿捐赠支持
 本插件完全免费开源，无任何功能锁定、付费门槛，所有人均可无限制下载、使用、二次修改。
