@@ -1,6 +1,4 @@
 import requests
-# 全局统一requests默认重试次数，与Adapter保持一致
-requests.adapters.DEFAULT_RETRIES = 8
 import time
 import json
 import tempfile
@@ -11,345 +9,850 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import cv2
 import urllib3
-from io import BytesIO
-# 彻底屏蔽HTTPS不安全证书警告
+import subprocess
+import shutil
+import logging
+import imageio
+from typing import Optional, Dict, Any, List, Tuple
+import asyncio
+import sys
+import pickle
+import warnings
+from pathlib import Path
+import re
+import glob
+
+# ====================== 【最彻底的 Windows 10054 错误抑制】 ======================
+warnings.filterwarnings("ignore", message=".*ProactorBasePipeTransport.*")
+warnings.filterwarnings("ignore", message=".*ConnectionResetError.*")
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+def ignore_connection_reset(exc_type, exc_val, exc_tb):
+    if exc_type is ConnectionResetError and ("10054" in str(exc_val) or "远程主机强迫关闭" in str(exc_val)):
+        return
+    sys.__excepthook__(exc_type, exc_val, exc_tb)
+sys.excepthook = ignore_connection_reset
+
+def asyncio_exception_handler(loop, context):
+    exc = context.get('exception')
+    if isinstance(exc, ConnectionResetError) and ("10054" in str(exc) or "远程主机强迫关闭" in str(exc)):
+        return
+    loop.default_exception_handler(context)
+try:
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
+except RuntimeError:
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(asyncio_exception_handler)
+    except:
+        pass
+# =================================================================================
+
+logger = logging.getLogger("XiaoMoAgnesVideo")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# -------------------------- API 固定常量 --------------------------
-BASE_CREATE_URL = "https://apihub.agnes-ai.com/v1/videos"
-BASE_VIDEO_QUERY_URL = "https://apihub.agnes-ai.com/agnesapi"
-MODEL_NAME = "agnes-video-v2.0"
+_current_node_unique_id = None
+def set_current_node_id(unique_id):
+    global _current_node_unique_id
+    _current_node_unique_id = unique_id
 
-# -------------------------- 请求会话（强制忽略系统代理/VPN） --------------------------
-def get_http_session():
+def update_frontend_progress(percent: float):
+    try:
+        percent = max(0.0, min(100.0, float(percent)))
+        if _current_node_unique_id is None: return
+        import comfy.execution
+        exec_obj = comfy.execution.current_execution.get()
+        if exec_obj and hasattr(exec_obj, 'set_progress'):
+            exec_obj.set_progress(_current_node_unique_id, int(percent))
+    except Exception: pass
+
+_ffmpeg_path_cache = None
+def find_ffmpeg() -> Optional[str]:
+    global _ffmpeg_path_cache
+    if _ffmpeg_path_cache is not None: return _ffmpeg_path_cache if _ffmpeg_path_cache else None
+    ffmpeg_exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    system_ffmpeg = shutil.which(ffmpeg_exe)
+    if system_ffmpeg:
+        _ffmpeg_path_cache = system_ffmpeg
+        logger.info(f"【FFmpeg检测】找到系统FFmpeg: {system_ffmpeg}")
+        return system_ffmpeg
+    try:
+        current_dir = Path(__file__).resolve().parent
+        for _ in range(6):
+            for candidate in [
+                current_dir / ffmpeg_exe, current_dir / "bin" / ffmpeg_exe,
+                current_dir / "python_embeded" / ffmpeg_exe,
+                current_dir / "python_embeded" / "Scripts" / ffmpeg_exe
+            ]:
+                if candidate.exists():
+                    _ffmpeg_path_cache = str(candidate.resolve())
+                    logger.info(f"【FFmpeg检测】找到本地FFmpeg: {_ffmpeg_path_cache}")
+                    return _ffmpeg_path_cache
+            current_dir = current_dir.parent
+    except Exception: pass
+    _ffmpeg_path_cache = ""
+    logger.info("【FFmpeg检测】未找到FFmpeg，将使用imageio编码")
+    return None
+
+def get_http_session(proxy: str = "", verify_ssl: bool = True) -> requests.Session:
     session = requests.Session()
-    session.trust_env = False
-    retry = Retry(
-        total=12,
-        backoff_factor=4,
-        status_forcelist=[429, 500, 502, 503, 504, 408, 520, 521, 522],
-        allowed_methods=["GET", "POST", "HEAD"],
-        raise_on_status=False
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=20,
-        pool_maxsize=20,
-        pool_block=True
-    )
+    session.verify = verify_ssl
+    if proxy.strip():
+        session.proxies = {"http": proxy.strip(), "https": proxy.strip()}
+        session.trust_env = False
+    else:
+        # 如果没有填代理，则使用系统网络环境（兼容 VPN 或直连）
+        session.trust_env = True
+    retry = Retry(total=2, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50, pool_block=True)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    
-    # 连接保活
-    session.headers.update({
-        "Connection": "keep-alive",
-        "Keep-Alive": "timeout=180, max=100"
-    })
+    session.headers.update({"Connection": "keep-alive", "Keep-Alive": "timeout=300, max=200"})
     return session
 
-# -------------------------- 最终兼容版ComfyUI标准视频包装类 --------------------------
-class ComfyVideoWrapper:
-    def __init__(self, tensor):
-        self.tensor = tensor
-        self.batch, self.frames, self.height, self.width, self.channels = tensor.shape
+class AgnesVideoWrapper:
+    def __init__(self, frames: torch.Tensor, fps: float = 24.0, raw_video_bytes: bytes = b""):
+        if frames.dtype == torch.uint8: frames = frames.float() / 255.0
+        if frames.dim() == 4: self.frames = frames.unsqueeze(0)
+        elif frames.dim() == 5: self.frames = frames
+        else: raise ValueError(f"不支持的视频张量维度: {frames.dim()}")
+        self._batch, self._t, self._h, self._w, self._c = self.frames.shape
+        self.fps = float(fps)
+        self._metadata: Dict[str, Any] = {}
+        self._raw_bytes = raw_video_bytes
 
-    def get_dimensions(self):
-        return (self.width, self.height)
-
-    def save_to(self, filepath, frame_rate=24, format="mp4", codec="libx264", **kwargs):
-        import imageio
-        writer_kwargs = {}
-        writer_kwargs["fps"] = frame_rate if frame_rate and frame_rate > 0 else 24
-        if format and isinstance(format, str) and format.strip() and format.lower() != "auto":
-            writer_kwargs["format"] = format.strip()
-        if codec and isinstance(codec, str) and codec.strip() and codec.lower() != "auto":
-            writer_kwargs["codec"] = codec.strip()
-
-        frames_np = self.tensor.squeeze(0).clamp(0.0, 1.0).cpu().numpy()
-        frames_np = (frames_np * 255).astype(np.uint8)
-
-        if frames_np.shape[-1] == 4:
-            frames_np = frames_np[..., :3]
-        elif frames_np.shape[-1] not in (1, 2, 3, 4):
-            raise ValueError(f"不支持的视频通道数: {frames_np.shape[-1]}，仅支持1/2/3/4通道")
-
-        writer = imageio.get_writer(filepath, **writer_kwargs)
-        try:
-            for frame in frames_np:
-                writer.append_data(frame)
-        finally:
-            writer.close()
-
-    def __getitem__(self, idx):
-        return self.tensor[idx]
-
+    def get_dimensions(self) -> Tuple[int, int]: return (self._w, self._h)
+    def __len__(self) -> int: return self._t
+    def __getitem__(self, idx): return self.frames[idx]
     @property
-    def shape(self):
-        return self.tensor.shape
+    def shape(self) -> torch.Size: return self.frames.shape
+    @property
+    def duration(self) -> float: return self._t / self.fps
+    @property
+    def metadata(self) -> Dict[str, Any]: return self._metadata
+    @metadata.setter
+    def metadata(self, value: Dict[str, Any]): self._metadata = value or {}
+    def get_frame(self, index: int) -> torch.Tensor: return self.frames[0, index]
 
-# -------------------------- 自定义节点主体 --------------------------
+    def save_to(self, output_path, *, format="mp4", codec="auto", pix_fmt="yuv420p", audio_file=None, metadata=None, **kwargs):
+        output_dir = os.path.dirname(output_path)
+        if output_dir: os.makedirs(output_dir, exist_ok=True)
+        if metadata: self._metadata.update(metadata)
+        is_mp4_target = format in ("mp4", "video/mp4", "auto") or output_path.lower().endswith(".mp4")
+        no_transcode_needed = (codec in ("auto", None)) and (audio_file is None) and is_mp4_target
+        if len(self._raw_bytes) > 1024 and no_transcode_needed:
+            try:
+                with open(output_path, "wb") as f: f.write(self._raw_bytes)
+                if os.path.getsize(output_path) == len(self._raw_bytes):
+                    logger.info("【视频保存】原始视频无损直传完成")
+                    return self._build_result_dict(output_path)
+            except Exception as e: logger.warning(f"【视频保存】直传失败，降级编码: {str(e)}")
+        frames_np = self.frames[0].clamp(0.0, 1.0).cpu().numpy()
+        frames_np = (frames_np * 255).astype(np.uint8)
+        if frames_np.shape[-1] == 4: frames_np = frames_np[..., :3]
+        ffmpeg_path = find_ffmpeg()
+        if ffmpeg_path:
+            try:
+                self._encode_with_ffmpeg(ffmpeg_path, output_path, frames_np, format, codec, pix_fmt, audio_file)
+                logger.info(f"【视频保存】FFmpeg编码完成: {os.path.basename(output_path)}")
+                return self._build_result_dict(output_path)
+            except Exception as e: logger.warning(f"【视频保存】FFmpeg失败，降级imageio: {str(e)}")
+        try:
+            writer_kwargs = {"fps": self.fps}
+            if format and format != "auto": writer_kwargs["format"] = format
+            if codec and codec != "auto": writer_kwargs["codec"] = codec
+            writer = imageio.get_writer(output_path, **writer_kwargs)
+            try:
+                for frame in frames_np: writer.append_data(frame)
+            finally: writer.close()
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                logger.info("【视频保存】imageio编码完成")
+                return self._build_result_dict(output_path)
+        except Exception as e: logger.warning(f"【视频保存】imageio失败，降级OpenCV: {str(e)}")
+        try:
+            self._encode_with_opencv(output_path, frames_np)
+            logger.info("【视频保存】OpenCV兜底完成")
+            return self._build_result_dict(output_path)
+        except Exception as e:
+            if len(self._raw_bytes) > 1024:
+                logger.warning("【视频保存】所有编码均失败，强制输出原始视频")
+                with open(output_path, "wb") as f: f.write(self._raw_bytes)
+                return self._build_result_dict(output_path)
+            raise RuntimeError(f"视频保存失败: {str(e)}")
+
+    def _build_result_dict(self, output_path: str) -> Dict[str, str]:
+        import folder_paths
+        abs_path = os.path.abspath(output_path)
+        base_output = os.path.abspath(folder_paths.get_output_directory())
+        subfolder = ""
+        try:
+            rel = os.path.relpath(os.path.dirname(abs_path), base_output)
+            if rel != ".": subfolder = rel
+        except ValueError: pass
+        return {"filename": os.path.basename(abs_path), "subfolder": subfolder, "type": "output"}
+
+    def _encode_with_ffmpeg(self, ffmpeg_path, file_path, frames_np, fmt, codec, pix_fmt, audio_file):
+        cmd = [ffmpeg_path, "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{self._w}x{self._h}", "-pix_fmt", "rgb24", "-r", str(self.fps), "-i", "-", "-pix_fmt", pix_fmt, "-movflags", "+faststart"]
+        if codec and codec != "auto": cmd.extend(["-vcodec", codec])
+        else: cmd.extend(["-vcodec", "libx264", "-preset", "medium", "-crf", "20", "-profile:v", "high"])
+        if audio_file and os.path.isfile(audio_file): cmd.extend(["-i", audio_file, "-c:a", "aac", "-b:a", "320k", "-shortest"])
+        cmd.append(file_path)
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8, creationflags=flags)
+        try:
+            for frame in frames_np: proc.stdin.write(frame.tobytes())
+            proc.stdin.close()
+            ret = proc.wait(timeout=600)
+            if ret != 0:
+                err = proc.stderr.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"FFmpeg错误: {err[-600:]}")
+            if not os.path.exists(file_path) or os.path.getsize(file_path) < 1024: raise RuntimeError("输出文件异常")
+        finally:
+            if proc.poll() is None: proc.kill(); proc.wait()
+
+    def _encode_with_opencv(self, file_path, frames_np):
+        fourcc_list = [("mp4v", ".mp4"), ("MJPG", ".avi"), ("XVID", ".avi")]
+        last_err = None
+        frame_count = len(frames_np)
+        for code, ext in fourcc_list:
+            cur_path = file_path
+            if not cur_path.lower().endswith(ext):
+                base, _ = os.path.splitext(cur_path); cur_path = base + ext
+            fourcc = cv2.VideoWriter_fourcc(*code)
+            writer = cv2.VideoWriter(cur_path, fourcc, self.fps, (self._w, self._h))
+            if not writer.isOpened():
+                last_err = f"编码器{code}初始化失败"; continue
+            try:
+                ok = 0
+                for i in range(frame_count):
+                    bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
+                    if writer.write(bgr): ok += 1
+                writer.release()
+                if ok == frame_count and os.path.exists(cur_path) and os.path.getsize(cur_path) > 1024:
+                    if cur_path != file_path:
+                        try:
+                            if os.path.exists(file_path): os.remove(file_path)
+                            os.rename(cur_path, file_path)
+                        except: pass
+                    return
+                else: last_err = f"编码器{code}写入{ok}/{frame_count}帧"
+            except Exception as e:
+                last_err = str(e)
+                if writer.isOpened(): writer.release()
+        raise RuntimeError(f"OpenCV全部编码器失败，最后错误: {last_err}")
+
+CHUNK_SIZE = 8192
+MAX_POLL_SECONDS = 7200
+NETWORK_TIMEOUT = 300  
+MAX_INT32 = 2 ** 31 - 1
+
+# 官方公开接口常量
+BASE_QUERY = "https://apihub.agnes-ai.com/agnesapi"
+BASE_QUERY_OLD = "https://apihub.agnes-ai.com/v1/videos"
+MODEL = "agnes-video-v2.0"
+CHAT_ENDPOINT = "https://apihub.agnes-ai.com/v1/chat/completions"
+FLASH_MODEL = "agnes-2.0-flash"
+VISION_TIMEOUT = 120
+VISION_RETRY = 3
+VISION_TPL = """你是专业视频提示词工程师，根据图片生成JSON格式的正负向提示词：
+{"positive":"正向提示词，电影级画质，细节丰富，描述精准","negative":"负面提示词，低质、模糊、畸形、水印等"}
+只输出JSON，不要多余内容。"""
+DEFAULT_NEG = "模糊,低分辨率,畸形,水印,文字,多余肢体,扭曲,崩坏,低画质,闪烁,卡顿,色彩失真,伪影,噪点"
+FALLBACK_POS = "电影级动态视频，高清画质，平滑运镜，自然光影，丰富细节，流畅动画，真实质感"
+FALLBACK_NEG = DEFAULT_NEG
+CACHE_DIR = Path("./agnes_task_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+# ====================== 【12 图床集群】免登录容灾上传器 ======================
+class MultiImageUploader:
+    CACHE_FILE = Path("./agnes_image_cache.json")
+    
+    SUPPORTED_HOSTS = [
+        "freeimagehost",
+        "postimages",   
+        "pixeldrain",   
+        "uploadcc",      
+        "vgy",           
+        "telegraph",     
+        "jpgfi",         
+        "uguu",          
+        "pomfcat",       
+        "imgr",          
+        "imagefile",     
+        "b2pics"         
+    ]
+
+    @staticmethod
+    def load_cache() -> Dict[str, str]:
+        if MultiImageUploader.CACHE_FILE.exists():
+            try:
+                with open(MultiImageUploader.CACHE_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    @staticmethod
+    def save_cache(cache: Dict[str, str]):
+        try:
+            with open(MultiImageUploader.CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+
+    @staticmethod
+    def _upload_to_host(file_path: str, host: str, proxy: str, freeimage_key: str = "", verify_ssl: bool = True) -> Optional[str]:
+        filename = os.path.basename(file_path)
+        session = requests.Session()
+        session.verify = verify_ssl
+        if proxy.strip():
+            session.proxies = {"http": proxy, "https": proxy}
+        session.headers.update({"Connection": "keep-alive", "User-Agent": "Mozilla/5.0"})
+        
+        try:
+            with open(file_path, "rb") as f:
+                if host == "freeimagehost":
+                    # 未配置密钥时自动跳过
+                    if not freeimage_key.strip():
+                        logger.debug(f"【图床集群】freeimagehost 未配置API密钥，跳过")
+                        return None
+                    url = "https://freeimage.host/api/1/upload"
+                    files = {"source": (filename, f)}
+                    data = {"key": freeimage_key.strip(), "action": "upload", "format": "json"}
+                    resp = session.post(url, data=data, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("status_code") == 200:
+                        return res_json.get("image", {}).get("url")
+                    raise RuntimeError(f"Freeimage 拒绝: {res_json.get('status_txt', '未知')}")
+
+                elif host == "postimages":
+                    url = "https://postimages.org/api/upload"
+                    files = {"upload": (filename, f)}
+                    data = {"uploadtype": "file", "format": "json"}
+                    resp = session.post(url, data=data, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("success"):
+                        return res_json.get("url")
+                    raise RuntimeError("Postimages 上传失败")
+
+                elif host == "pixeldrain":
+                    url = "https://pixeldrain.com/api/file"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("success"):
+                        return f"https://pixeldrain.com/u/{res_json.get('id')}"
+                    raise RuntimeError("Pixeldrain 上传失败")
+
+                elif host == "uploadcc":
+                    url = "https://upload.cc/upload"
+                    files = {"file": (filename, f)}
+                    data = {"format": "json"}
+                    resp = session.post(url, data=data, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("code") == 200:
+                        return res_json["data"]["url"]
+                    raise RuntimeError(f"Upload.cc 拒绝: {res_json.get('msg', '未知')}")
+
+                elif host == "vgy":
+                    url = "https://vgy.me/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("url"):
+                        return res_json["url"]
+                    raise RuntimeError("Vgy.me 上传失败")
+
+                elif host == "telegraph":
+                    url = "https://telegra.ph/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if len(res_json) > 0 and "src" in res_json[0]:
+                        return "https://telegra.ph" + res_json[0]["src"]
+                    raise RuntimeError("Telegraph 上传失败")
+
+                elif host == "jpgfi":
+                    url = "https://jpg.fi/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    text = resp.text.strip()
+                    if text.startswith("https://"):
+                        return text
+                    raise RuntimeError(f"JPG.FI 返回异常: {text}")
+
+                elif host == "uguu":
+                    url = "https://uguu.se/api.php?d=upload-tool"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    text = resp.text.strip()
+                    if text.startswith("https://"):
+                        return text
+                    raise RuntimeError(f"Uguu 返回异常: {text}")
+
+                elif host == "pomfcat":
+                    url = "https://pomf.lain.la/upload"
+                    files = {"files[]": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("success"):
+                        return res_json.get("files")[0]["url"]
+                    raise RuntimeError("Pomf 上传失败")
+
+                elif host == "imgr":
+                    url = "https://imgr.xyz/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    text = resp.text.strip()
+                    if text.startswith("http"):
+                        return text
+                    raise RuntimeError(f"ImgR 返回异常: {text}")
+
+                elif host == "imagefile":
+                    url = "https://imagefile.ru/api/v1/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    res_json = resp.json()
+                    if res_json.get("status") == 200:
+                        return res_json.get("data", {}).get("link")
+                    raise RuntimeError(f"ImageFile 拒绝: {res_json.get('message', '未知')}")
+
+                elif host == "b2pics":
+                    url = "https://b2.pics/upload"
+                    files = {"file": (filename, f)}
+                    resp = session.post(url, files=files, timeout=30)
+                    resp.raise_for_status()
+                    text = resp.text.strip()
+                    if text.startswith("https://"):
+                        return text
+                    raise RuntimeError(f"B2.Pics 返回异常: {text}")
+
+        except Exception as e:
+            logger.warning(f"【图床集群】{host} 尝试失败: {str(e)}")
+            return None
+        finally:
+            session.close()
+        return None
+
+    @staticmethod
+    def upload_file(file_path: str, proxy: str = "", freeimage_key: str = "", verify_ssl: bool = True) -> str:
+        cache = MultiImageUploader.load_cache()
+        abs_path = str(Path(file_path).resolve())
+        if abs_path in cache:
+            logger.info(f"【图床集群】命中缓存: {os.path.basename(file_path)}")
+            return cache[abs_path]
+
+        if not os.path.exists(file_path):
+            raise RuntimeError(f"文件不存在: {file_path}")
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            raise RuntimeError(f"文件为空: {file_path}")
+        if file_size > 200 * 1024 * 1024:
+            raise RuntimeError(f"文件超过200MB上限: {file_path}")
+
+        logger.info(f"【图床集群】开始上传: {os.path.basename(file_path)}")
+        
+        failed_hosts = []
+        for host in MultiImageUploader.SUPPORTED_HOSTS:
+            url = MultiImageUploader._upload_to_host(file_path, host, proxy, freeimage_key, verify_ssl)
+            if url:
+                logger.info(f"【图床集群】✅ {host} 上传成功: {url}")
+                cache[abs_path] = url
+                MultiImageUploader.save_cache(cache)
+                return url
+            else:
+                failed_hosts.append(host)
+
+        raise RuntimeError(
+            f"【图床集群】12个图床全部尝试失败！\n"
+            f"失败列表: {', '.join(failed_hosts)}\n"
+            f"检查项：网络环境是否正常？是否需要配置代理？"
+        )
+
+    @staticmethod
+    def process_folder_images(folder_path: str, proxy: str = "", freeimage_key: str = "", verify_ssl: bool = True) -> List[str]:
+        folder = Path(folder_path)
+        if not folder.exists() or not folder.is_dir():
+            raise RuntimeError(f"文件夹不存在: {folder_path}")
+
+        image_files = []
+        for ext in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"]:
+            image_files.extend(folder.glob(ext))
+            
+        if not image_files:
+            raise RuntimeError(f"文件夹中未找到图片: {folder_path}")
+
+        def get_number(p):
+            nums = re.findall(r'\d+', p.stem)
+            return int(nums[0]) if nums else 999999
+        image_files.sort(key=get_number)
+        
+        logger.info(f"【文件夹模式】找到 {len(image_files)} 张图片，按序上传")
+        urls = []
+        for f in image_files:
+            urls.append(MultiImageUploader.upload_file(str(f), proxy, freeimage_key, verify_ssl))
+        return urls
+
+def save_cache(task_id: str, data: Dict):
+    try:
+        with open(CACHE_DIR / f"{task_id}.pkl", 'wb') as f:
+            pickle.dump({"task_id": task_id, "data": data, "time": time.time()}, f)
+    except: pass
+
+def load_cache(task_id: str) -> Optional[Dict]:
+    p = CACHE_DIR / f"{task_id}.pkl"
+    if not p.exists(): return None
+    try:
+        with open(p, 'rb') as f: return pickle.load(f)
+    except: return None
+
+class PromptHelper:
+    @staticmethod
+    def vision_gen(api_key: str, imgs: List[str], proxy: str = "", verify_ssl: bool = True) -> Dict[str, str]:
+        tag = "【识图生成提示词】"
+        sess = get_http_session(proxy, verify_ssl)
+        headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
+        content = [{"type": "text", "text": VISION_TPL.strip()}]
+        for url in imgs:
+            content.append({"type": "image_url", "image_url": {"url": url.strip()}})
+        payload = {"model": FLASH_MODEL, "messages": [{"role": "user", "content": content}], "temperature": 0.4, "max_tokens": 2048}
+        for i in range(VISION_RETRY):
+            try:
+                logger.info(f"{tag} 第{i+1}次调用，图片数：{len(imgs)}")
+                r = sess.post(CHAT_ENDPOINT, headers=headers, json=payload, timeout=(NETWORK_TIMEOUT, VISION_TIMEOUT))
+                if r.status_code in (401, 403): break
+                r.raise_for_status()
+                res = r.json()
+                text = res["choices"][0]["message"]["content"].strip()
+                s, e = text.find("{"), text.rfind("}") + 1
+                if s == -1 or e == 0: raise ValueError("返回非JSON")
+                data = json.loads(text[s:e])
+                pos = data.get("positive", "").strip()
+                neg = data.get("negative", "").strip()
+                if not pos: raise ValueError("正向提示词为空")
+                logger.info(f"{tag} 成功 | 正向前80字：{pos[:80]}...")
+                sess.close()
+                return {"positive": pos, "negative": neg}
+            except Exception as e:
+                wait = 2 * (i + 1)
+                logger.warning(f"{tag} 第{i+1}次失败：{str(e)[:80]}，等待{wait}秒")
+                time.sleep(wait)
+        sess.close()
+        logger.warning(f"{tag} 全部失败，使用通用降级提示词")
+        return {"positive": FALLBACK_POS, "negative": FALLBACK_NEG}
+
+def decode_video(vid_bytes: bytes, tw: int, th: int, t_frames: int) -> torch.Tensor:
+    frames = []
+    tmp = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(vid_bytes); f.flush(); tmp = f.name
+        cap = cv2.VideoCapture(tmp)
+        if cap.isOpened():
+            while cap.isOpened() and len(frames) < t_frames * 2:
+                ret, frame = cap.read()
+                if not ret: break
+                if frame.shape[:2] != (th, tw): frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(np.array(rgb, dtype=np.float32) / 255.0)
+            cap.release()
+        logger.info(f"【视频解码】读取到{len(frames)}帧，分辨率{tw}x{th}")
+    except Exception as e:
+        logger.warning(f"【视频解码】OpenCV失败: {e}")
+        try:
+            from io import BytesIO
+            stream = BytesIO(vid_bytes)
+            reader = imageio.get_reader(stream, format="mp4")
+            frames.clear()
+            for frame in reader:
+                if frame.shape[:2] != (th, tw): frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+                frames.append(np.array(frame, dtype=np.float32) / 255.0)
+            reader.close()
+            logger.info(f"【视频解码】imageio兜底读取{len(frames)}帧")
+        except Exception as e2: logger.error(f"【视频解码】imageio也失败: {e2}")
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.unlink(tmp)
+            except: pass
+    if not frames: raise RuntimeError("视频解码失败，文件可能损坏")
+    if len(frames) > t_frames:
+        step = len(frames) / t_frames
+        frames = [frames[int(i * step)] for i in range(t_frames)]
+    elif len(frames) < t_frames:
+        frames += [frames[-1]] * (t_frames - len(frames))
+    return torch.from_numpy(np.stack(frames, axis=0)).unsqueeze(0)
+
 class XiaoMoAgnesVideo:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"multiline": False, "placeholder": "sk-粘贴你的Agnes API密钥"}),
-                "img_url": ("STRING", {"multiline": True, "placeholder": "图生视频填公网图片HTTPS直链，文生视频留空", "default": ""}),
-                "prompt_ext": ("STRING", {"multiline": False, "placeholder": "【外接扩展输入】可接入大模型文本节点，自动生成/优化正向提示词，为空则使用下方prompt", "default": ""}),
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "",
-                    "placeholder": """=====【正向提示词全题材通用编写规范】=====
-一、文生视频（无参考图）标准结构：主体 + 细微动作 + 场景环境 + 光影氛围 + 镜头运镜 + 画质风格
-1.真人/写实模板：年轻女生，缓慢抬手撩发，城市黄昏街道，柔和逆光，缓慢平移镜头，8k写实电影质感，人物全程五官不变，无画面抖动
-2.动漫/二次元模板：日系少女，轻轻摆动裙摆，樱花街道，柔和马卡龙光影，固定机位，细腻赛璐璐上色，人物五官发型全程统一
-3.科幻/游戏模板：机甲战士，缓步移动，赛博雨夜都市，霓虹漫反射，推拉镜头，高细节3A游戏画质，机甲造型不畸变
-4.产品/静物模板：陶瓷水杯，轻微水雾流动，原木桌面，柔光侧拍，缓慢环绕运镜，产品轮廓完全不变
-5.动物通用模板：猫咪轻轻晃动尾巴，窗边柔光，微小呼吸起伏，固定机位，毛发纹理稳定
-
-二、图生视频（上传图片必看）
-只写画面微动，禁止修改原图人物/动漫形象/物体/背景
-示例：动漫人物发丝随风轻飘，窗外灯光明暗渐变，全程保持原图画风、人物五官、服饰完全一致
-
-三、通用加分关键词：平滑微运动、主体高度稳定、无画面闪烁、电影级光影、超高细节"""
-                }),
-                "neg_prompt_ext": ("STRING", {"multiline": False, "placeholder": "【外接扩展输入】可接入大模型文本，自动生成反向词，为空读取下方neg_prompt", "default": ""}),
-                "neg_prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "",
-                    "placeholder": """=====【全题材通用反向提示规范】=====
-# 真人/动漫共用人物崩坏（最高优先级）
-面部扭曲、五官错位、眼睛变形、多眼多嘴、肢体穿插、手脚畸形、人物样貌突变、动漫脸型崩坏、线条扭曲
-
-# 画面动态缺陷
-画面剧烈闪烁、画面抖动、光影跳变、物体凭空消失/新增、镜头剧烈晃动
-
-# 画质与结构瑕疵
-模糊、低分辨率、水印文字、色块撕裂、透视错乱、物体融化、线条崩坏、动漫上色溢色
-
-# 题材专属避雷
-动漫：画风突变、轮廓变形、色块断层；真人：皮肤畸形；科幻：机甲结构崩坏；动物：五官扭曲"""
-                }),
-                "width": ("INT", {"default": 1152, "min": 512, "max": 2048, "step": 64}),
-                "height": ("INT", {"default": 768, "min": 512, "max": 2048, "step": 64}),
+                "pos_text": ("STRING", {"default": "", "forceInput": True}),
+                "neg_text": ("STRING", {"default": "", "forceInput": True}),
+                "api_key": ("STRING", {"multiline": False, "placeholder": "Agnes API密钥"}),
+                "gen_mode": (["auto", "txt2vid", "img2vid", "multi_img"], {"default": "auto"}),
+                "music_platform": (["none"], {"default": "none"}),
+                "music_api_key": ("STRING", {"multiline": False, "default": ""}),
+                "img_url": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 1152, "min": 512, "max": 2048, "step": 8}),
+                "height": ("INT", {"default": 768, "min": 512, "max": 2048, "step": 8}),
                 "num_frames": ("INT", {"default": 81, "min": 81, "max": 441, "step": 8}),
                 "frame_rate": ("INT", {"default": 24, "min": 1, "max": 60}),
+                "num_inference_steps": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "seed": ("INT", {"default": 123456}),
                 "seed_mode": (["randomize", "fixed"], {"default": "randomize"}),
-                "poll_interval": ("INT", {"default": 8, "min": 2, "max": 20}),
+                "poll_interval": ("INT", {"default": 15, "min": 5, "max": 30}),
+                "http_proxy": ("STRING", {"default": ""}),
+                "task_recovery_id": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "api_create_endpoint": ("STRING", {"default": "https://apihub.agnes-ai.com/agnesapi", "multiline": False}),
+                "freeimage_api_key": ("STRING", {"default": "", "multiline": False, "placeholder": "Freeimage图床密钥，可选"}),
+                "disable_ssl_verify": ("BOOLEAN", {"default": False}),
             }
         }
-
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("视频输出", "完整任务JSON")
+    RETURN_TYPES = ("VIDEO", "STRING", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("视频", "完整任务JSON", "是否需要音频", "任务ID")
     FUNCTION = "run"
-    CATEGORY = "肖默定制插件"
+    CATEGORY = "肖默定制/Agnes视频生成"
 
-    def run(self, api_key, img_url, prompt_ext, prompt, neg_prompt_ext, neg_prompt,
-            width, height, num_frames, frame_rate, seed, seed_mode, poll_interval):
-        final_prompt = prompt_ext.strip() or prompt.strip()
-        final_neg = neg_prompt_ext.strip() or neg_prompt.strip()
+    def run(self, pos_text, neg_text, api_key, gen_mode, music_platform, music_api_key,
+            img_url, width, height, num_frames, frame_rate, num_inference_steps,
+            seed, seed_mode, poll_interval, http_proxy, task_recovery_id,
+            api_create_endpoint = "https://apihub.agnes-ai.com/agnesapi",
+            freeimage_api_key = "",
+            disable_ssl_verify = False):
         
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        # 动态计算SSL验证开关
+        verify_ssl = not disable_ssl_verify
         
-        payload = {
-            "model": MODEL_NAME,
-            "prompt": final_prompt,
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-        }
-        img_clean = img_url.strip()
-        if img_clean:
-            payload["image"] = img_clean
-        if final_neg:
-            payload["negative_prompt"] = final_neg
-        if seed_mode == "fixed":
-            payload["seed"] = seed
-
-        full_task_json = {}
-        video_id = None
-        video_url = None
-        printed_vid_flag = False
-
-        def cut_text(text, limit=80):
-            return text[:limit] + "..." if len(text) > limit else text
-
-        # ========== 1. 创建任务 ==========
-        print("🚀【步骤1/4】正在提交 Agnes V2.0 视频生成任务...")
-        print(f"📝 正向提示词：{cut_text(final_prompt)}")
-        if final_neg:
-            print(f"🚫 反向提示词：{cut_text(final_neg)}")
-        if img_clean:
-            print(f"🖼️ 参考图链接：{cut_text(img_clean)}")
-        print(f"📐 分辨率 {width}×{height}，总帧数 {num_frames}，帧率 {frame_rate}FPS")
-
-        session = get_http_session()
-        try:
-            resp = session.post(BASE_CREATE_URL, headers=headers, json=payload, timeout=(30, 300), verify=False)
-            resp.raise_for_status()
-            task_data = resp.json()
-            full_task_json = task_data
-            err_msg = task_data.get("error")
-            if err_msg is not None and str(err_msg).strip() != "":
-                raise Exception(f"【创建任务业务报错】{err_msg}")
-            video_id = task_data.get("video_id") or task_data.get("task_id")
-            if not video_id:
-                raise Exception("接口返回数据异常：未获取到video_id/task_id")
-            print(f"✅ 任务创建成功，video_id: {video_id}")
-        except requests.exceptions.ReadTimeout:
-            raise Exception("【网络读取超时】提交任务请求读取超时")
-        except requests.exceptions.ConnectTimeout:
-            raise Exception("【网络连接超时】无法连接API服务器，检查代理/网络")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"【创建任务网络请求失败】{str(e)}")
-
-        # ========== 2. 轮询生成进度 ==========
-        print("\n⏳【步骤2/4】开始轮询任务生成进度，最长等待20分钟...")
-        print("💡 提示：视频生成通常需要 3~15 分钟，请耐心等待！")
-        
-        waited = 0
-        max_wait = 1200
-        
-        while waited < max_wait:
-            time.sleep(poll_interval)
-            waited += poll_interval
-            
-            try:
-                poll_session = get_http_session()
-                query_params = {"video_id": video_id, "model_name": MODEL_NAME}
-                
-                stat_resp = poll_session.get(BASE_VIDEO_QUERY_URL, headers=headers, params=query_params, timeout=(20, 90), verify=False)
-                stat_resp.raise_for_status()
-                task_info = stat_resp.json()
-                full_task_json = task_info
-                
-                err_msg = task_info.get("error")
-                if err_msg is not None and str(err_msg).strip() != "":
-                    raise Exception(f"【轮询任务业务报错】{err_msg}")
-                
-                status = task_info.get("status", "")
-                progress = task_info.get("progress", 0)
-                
-                if not printed_vid_flag:
-                    print(f"📌 当前查询任务ID：{video_id}")
-                    printed_vid_flag = True
-                
-                print(f"⏱️ 任务状态: {status} | 进度: {progress}% | 已等待 {waited}s / {max_wait}s")
-                
-                if status == "completed":
-                    video_url = task_info.get("remixed_from_video_id") or task_info.get("url") or task_info.get("video_url")
-                    if not video_url:
-                        raise Exception("任务已完成，但接口未返回视频下载链接")
-                    print("🎉 视频生成完成，准备下载文件...")
-                    break
-                elif status == "failed":
-                    err = task_info.get("error") or "无详细失败原因"
-                    raise Exception(f"【视频生成失败】{err}")
-                    
-            except requests.exceptions.ReadTimeout:
-                print(f"⚠️ 单次轮询读取超时，{poll_interval}秒后自动重试...")
-                continue
-            except requests.exceptions.ConnectTimeout:
-                print(f"⚠️ 单次轮询连接服务器超时，{poll_interval}秒后自动重试...")
-                continue
-            except requests.exceptions.RequestException as e:
-                print(f"⚠️ 轮询请求异常（常见，重试中）：{str(e)[:120]}")
-                continue
-            except Exception as e:
-                print(f"⚠️ 轮询其他异常：{e}，继续重试...")
-                continue
-
-        if waited >= max_wait and not video_url:
-            raise Exception(f"任务轮询超时：已等待 {max_wait/60} 分钟仍未生成完成，请稍后重试")
-
-        # ========== 3. 下载视频 ==========
-        print("\n📥【步骤3/4】正在下载视频文件...")
-        try:
-            download_session = get_http_session()
-            vid_resp = download_session.get(video_url, timeout=(30, 180), verify=False, stream=True)
-            vid_resp.raise_for_status()
-            
-            vid_bytes = b""
-            for chunk in vid_resp.iter_content(chunk_size=8192):
-                if chunk:
-                    vid_bytes += chunk
-            
-            print(f"✅ 视频下载完成，文件大小：{round(len(vid_bytes)/1024/1024, 2)} MB")
-        except requests.exceptions.ReadTimeout:
-            raise Exception("【视频下载读取超时】服务器响应缓慢，请切换网络重试")
-        except requests.exceptions.ConnectTimeout:
-            raise Exception("【视频下载连接超时】无法访问视频资源地址")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"【视频下载请求失败】{str(e)}")
-
-        # ========== 4. 双方案解码 ==========
-        print("\n🔧【步骤4/4】解析视频帧，转换ComfyUI标准张量...")
-        frames = []
-        temp_file_path = ""
-        decode_success = False
+        current_input_hash = hash((pos_text.strip(), neg_text.strip(), img_url.strip(), width, height, num_frames, frame_rate, seed, gen_mode))
+        if hasattr(self, '_last_input_hash') and self._last_input_hash == current_input_hash:
+            tag = "【Agnes视频主流程】"
+            logger.info(f"{tag} 检测到输入参数未变化，本次跳过（避免重复提交/扣费）")
+            if hasattr(self, '_last_result'): return self._last_result
+            return (None, "{}", False, "")
+        self._last_input_hash = current_input_hash
 
         try:
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                tmp.write(vid_bytes)
-                tmp.flush()
-                temp_file_path = tmp.name
-            cap = cv2.VideoCapture(temp_file_path)
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_np = np.array(frame_rgb, dtype=np.float32) / 255.0
-                frames.append(frame_np)
-            cap.release()
-            if frames:
-                decode_success = True
-        except Exception:
-            print("⚠️ OpenCV解码失败，切换imageio内存解码...")
-        finally:
-            if os.path.exists(temp_file_path):
+            import inspect
+            for frame_info in inspect.stack():
+                frame = frame_info.frame
+                if 'unique_id' in frame.f_locals:
+                    set_current_node_id(frame.f_locals['unique_id']); break
+        except Exception: pass
+
+        tag = "【Agnes视频主流程】"
+        logger.info("=" * 70)
+        logger.info(f"{tag} 任务启动")
+        update_frontend_progress(5)
+        key = api_key.strip()
+        if not key: raise RuntimeError("Agnes API密钥不能为空")
+        if (num_frames - 1) % 8 != 0: raise RuntimeError("num_frames必须满足 8n+1 规则")
+        
+        # ==================== 统一入口解析（URL / 文件夹 / 文件） ====================
+        img_url_input = img_url.strip()
+        imgs = []
+        if img_url_input:
+            if img_url_input.startswith(('http://', 'https://')):
+                imgs = [u.strip() for u in img_url_input.split(",") if u.strip()]
+                logger.info(f"【URL模式】检测到 {len(imgs)} 个公网链接")
+            elif os.path.isdir(img_url_input):
+                # 本地文件夹模式
+                logger.info(f"【文件夹模式】检测到本地路径: {img_url_input}")
                 try:
-                    os.unlink(temp_file_path)
-                except:
-                    pass
+                    imgs = MultiImageUploader.process_folder_images(img_url_input, http_proxy, freeimage_api_key, verify_ssl)
+                except Exception as e:
+                    logger.error(f"【文件夹模式】处理失败: {e}")
+                    raise
+            elif os.path.isfile(img_url_input):
+                # 单张本地图片文件
+                logger.info(f"【单文件模式】检测到本地图片: {img_url_input}")
+                imgs.append(MultiImageUploader.upload_file(img_url_input, http_proxy, freeimage_api_key, verify_ssl))
+            else:
+                raise RuntimeError(f"img_url 无效，无法识别为有效的公网链接或本地文件路径: {img_url_input}")
+        # =====================================================================
+        
+        has_img = len(imgs) > 0
+        
+        if gen_mode == "auto":
+            mode = "txt2vid" if not has_img else "img2vid" if len(imgs) == 1 else "multi_img"
+        else: mode = gen_mode
+        
+        if mode in ("multi_img", "img2vid") and len(imgs) > 1:
+            logger.info("【关键帧模式】检测到多张图片，将按官方文档 `keyframes` 格式提交参数")
+            mode = "multi_img"
+        if mode in ("img2vid", "multi_img") and not has_img:
+            raise RuntimeError(f"{mode}模式必须传入图片URL或指定图片文件夹")
 
-        if not decode_success:
-            try:
-                import imageio
-                stream = BytesIO(vid_bytes)
-                reader = imageio.get_reader(stream, format="mp4")
-                frames.clear()
-                for frame in reader:
-                    frame_np = np.array(frame, dtype=np.float32) / 255.0
-                    frames.append(frame_np)
-                reader.close()
-                decode_success = True
-            except ImportError:
-                raise Exception("OpenCV解码失败，且未安装imageio！执行 pip install imageio imageio-ffmpeg 后重试")
-            except Exception as e:
-                raise Exception(f"两套解码方案全部失败：{str(e)}")
+        final_pos = pos_text.strip()
+        final_neg = neg_text.strip()
+        if not final_pos and not has_img: raise RuntimeError("文生视频必须填写正向提示词")
+        if not final_pos and has_img:
+            update_frontend_progress(8)
+            res = PromptHelper.vision_gen(key, imgs, http_proxy, verify_ssl)
+            final_pos = res["positive"]
+            final_neg = (final_neg + "，" + res["negative"]) if final_neg else res["negative"]
+        if not final_neg: final_neg = DEFAULT_NEG
 
-        if not frames:
-            raise Exception("视频解码失败，未读取到任何有效画面帧")
+        logger.info(f"{tag} 最终正向提示词: {final_pos[:120]}...")
+        sess = get_http_session(http_proxy, verify_ssl)
+        vid_id = task_recovery_id.strip()
+        vid_bytes = b""
+        tensor = None
+        aw, ah = width, height
+        last_info = None
 
-        frames_np = np.stack(frames, axis=0)
-        raw_tensor = torch.from_numpy(frames_np).unsqueeze(0)
-        video_out = ComfyVideoWrapper(raw_tensor)
-
-        print(f"✅ 全部处理完成！成功解析 {len(frames)} 帧，分辨率 {video_out.width}×{video_out.height}")
+        if vid_id:
+            cached_task = load_cache(vid_id)
+            if cached_task:
+                task_data = cached_task["data"]
+                logger.info(f"{tag} 检测到任务恢复，已加载本地缓存 | 模式: {task_data.get('mode', '未知')}")
+                mode = task_data.get("mode", mode)
+                final_pos = task_data.get("prompt", final_pos)
+                final_neg = task_data.get("negative_prompt", final_neg or DEFAULT_NEG)
+                recovered_w = task_data.get("width")
+                recovered_h = task_data.get("height")
+                if recovered_w and recovered_h: width, height = recovered_w, recovered_h; aw, ah = width, height
+                recovered_frames = task_data.get("num_frames")
+                recovered_rate = task_data.get("frame_rate")
+                if recovered_frames: num_frames = recovered_frames
+                if recovered_rate: frame_rate = recovered_rate
+                recovered_steps = task_data.get("num_inference_steps")
+                if recovered_steps is not None: num_inference_steps = recovered_steps
+                recovered_seed = task_data.get("seed")
+                if recovered_seed is not None: seed = recovered_seed
 
         try:
-            output_json = json.dumps(full_task_json, ensure_ascii=False, indent=2)
-        except Exception:
-            output_json = json.dumps({"info": "任务数据序列化失败"}, ensure_ascii=False)
+            if not vid_id:
+                payload = {
+                    "model": MODEL, "prompt": final_pos, "negative_prompt": final_neg,
+                    "width": width, "height": height, "num_frames": num_frames, "frame_rate": frame_rate,
+                }
+                if num_inference_steps > 0: payload["num_inference_steps"] = num_inference_steps
+                payload["seed"] = seed if seed_mode == "fixed" else np.random.randint(0, MAX_INT32)
 
-        return (video_out, output_json)
+                if mode in ("img2vid", "multi_img") and imgs:
+                    if len(imgs) == 1: payload["image"] = imgs[0]
+                    else:
+                        payload.setdefault("extra_body", {})["image"] = imgs
+                        payload.setdefault("extra_body", {})["mode"] = "keyframes"
+                
+                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+                r = sess.post(api_create_endpoint, headers=headers, json=payload, timeout=NETWORK_TIMEOUT)
+                
+                if r.status_code != 200:
+                    error_msg = r.text
+                    logger.error(f"【💥 错误详情】Agnes API 拒绝了你的请求！状态码：{r.status_code}")
+                    logger.error(f"【官方返回的具体原因】{error_msg}")
+                    raise RuntimeError(f"API 请求失败 (HTTP {r.status_code})，请查看上方日志获取详细错误信息。")
+                
+                data = r.json()
+                vid_id = data.get("video_id") or data.get("id") or data.get("task_id")
+                if not vid_id: raise RuntimeError("未返回有效任务ID")
+                logger.info(f"{tag} 任务提交成功 | ID: {vid_id}")
+                save_cache(vid_id, {
+                    "prompt": final_pos, "negative_prompt": final_neg, "seed": payload.get("seed"),
+                    "mode": mode, "width": width, "height": height, "num_frames": num_frames,
+                    "frame_rate": frame_rate, "num_inference_steps": num_inference_steps
+                })
 
-# 节点注册
+            waited = 0
+            video_url = None
+            while waited < MAX_POLL_SECONDS:
+                time.sleep(poll_interval)
+                waited += poll_interval
+                info = None
+                try:
+                    params = {"video_id": vid_id, "model_name": MODEL}
+                    r = sess.get(BASE_QUERY, headers={"Authorization": f"Bearer {key}"}, params=params, timeout=30)
+                    r.raise_for_status()
+                    info = r.json()
+                except Exception:
+                    try:
+                        r = sess.get(f"{BASE_QUERY_OLD}/{vid_id}", headers={"Authorization": f"Bearer {key}"}, timeout=30)
+                        r.raise_for_status()
+                        info = r.json()
+                    except Exception as query_err:
+                        logger.warning(f"{tag} 轮询查询失败，下一轮自动重试: {str(query_err)[:80]}")
+                if not info: continue
+                if "size" in info and info["size"]:
+                    size_str = info["size"]
+                    if "x" in size_str:
+                        try:
+                            w_str, h_str = size_str.lower().split("x")
+                            new_w, new_h = int(w_str), int(h_str)
+                            if (new_w, new_h) != (aw, ah): aw, ah = new_w, new_h
+                        except: pass
+                last_info = info
+                status = info.get("status", "")
+                prog = int(info.get("progress", 0))
+                update_frontend_progress(10 + prog * 0.85)
+                if status == "completed":
+                    video_url = info.get("remixed_from_video_id") or info.get("url") or info.get("video_url")
+                    if video_url:
+                        logger.info(f"{tag} 🎉 生成完成！视频URL已获取")
+                        break
+                elif status == "failed":
+                    raise RuntimeError(f"生成失败: {info.get('error', '未知错误')}")
+                remaining = MAX_POLL_SECONDS - waited
+                if 0 < remaining <= 60 and int(remaining) % 30 == 0:
+                    logger.warning(f"{tag} 任务即将超时，剩余约 {int(remaining)} 秒，当前进度 {prog}%")
+            if not video_url:
+                last_status = last_info.get("status", "未知") if last_info else "查询无响应"
+                last_prog = last_info.get("progress", 0) if last_info else 0
+                raise RuntimeError(f"轮询超时（已等待{waited}秒），最后状态: {last_status}，进度: {last_prog}%")
+
+            update_frontend_progress(93)
+            dl = sess.get(video_url, stream=True, timeout=180)
+            dl.raise_for_status()
+            vid_bytes = b"".join(dl.iter_content(CHUNK_SIZE))
+            update_frontend_progress(96)
+            tensor = decode_video(vid_bytes, aw, ah, num_frames)
+
+        except Exception as e:
+            if hasattr(self, '_last_input_hash'): delattr(self, '_last_input_hash')
+            logger.exception(f"{tag} 执行异常")
+            raise
+        finally:
+            try:
+                if 'sess' in locals() and sess is not None: sess.close()
+            except: pass
+            try: import gc; gc.collect()
+            except: pass
+            update_frontend_progress(100)
+
+        video_out = AgnesVideoWrapper(frames=tensor, fps=float(frame_rate), raw_video_bytes=vid_bytes)
+        out_json = json.dumps({
+            "mode": mode, "duration": round(num_frames / frame_rate, 2),
+            "resolution": f"{aw}x{ah}", "task_id": vid_id
+        }, ensure_ascii=False, indent=2)
+        self._last_result = (video_out, out_json, False, vid_id)
+        logger.info(f"{tag} ✅ 节点执行完成")
+        return self._last_result
+
 NODE_CLASS_MAPPINGS = {"XiaoMoAgnesVideo": XiaoMoAgnesVideo}
-NODE_DISPLAY_NAME_MAPPINGS = {"XiaoMoAgnesVideo": "肖默 - Agnes V2.0 图生视频节点"}
+NODE_DISPLAY_NAME_MAPPINGS = {"XiaoMoAgnesVideo": "XiaoMo Agnes Video V2.0"}
